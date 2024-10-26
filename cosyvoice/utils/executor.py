@@ -155,9 +155,7 @@ class Executor:
             num_utts = len(batch_dict["utts"])
             total_num_utts += num_utts
 
-            if self.gan is True:
-                batch_dict['turn'] = 'generator'
-            info_dict = batch_forward(model, batch_dict, None, info_dict)
+            info_dict = batch_forward(model, batch_dict, info_dict)
 
             for k, v in info_dict['loss_dict'].items():
                 if k not in total_loss_dict:

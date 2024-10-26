@@ -212,16 +212,16 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
 
     """
 
-    def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
+    def __init__(self, d_model, dropout_rate, max_len=5000):
         """Construct an PositionalEncoding object."""
         super(EspnetRelPositionalEncoding, self).__init__()
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+        self.extend_pe(torch.tensor(0.0).expand(1, 4096 * 2))
 
-    def extend_pe(self, x: torch.Tensor):
+    def extend_pe(self, x):
         """Reset the positional encodings."""
         if self.pe is not None:
             # self.pe contains both positive and negative parts
@@ -253,8 +253,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         pe = torch.cat([pe_positive, pe_negative], dim=1)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor, offset: Union[int, torch.Tensor] = 0) \
-            -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, offset: Union[int, torch.Tensor] = 0):
         """Add positional encoding.
 
         Args:
@@ -289,6 +288,16 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         """
         pos_emb = self.pe[
             :,
-            self.pe.size(1) // 2 - size + 1: self.pe.size(1) // 2 + size,
+            self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 + size,
+        ]
+        return pos_emb
+
+    def fix_position_encoding(self,
+                          offset: Union[int, torch.Tensor],
+                          size: int,
+                          max_len: int) -> torch.Tensor:
+        pos_emb = self.pe[
+            :,
+            self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 - size + 2 * max_len,
         ]
         return pos_emb

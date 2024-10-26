@@ -19,6 +19,8 @@ from typing import Tuple
 
 import torch
 import torch.utils.checkpoint as ckpt
+import torch.nn.functional as F
+import logging
 
 from cosyvoice.transformer.convolution import ConvolutionModule
 from cosyvoice.transformer.encoder_layer import TransformerEncoderLayer
@@ -32,6 +34,34 @@ from cosyvoice.utils.class_utils import (
 )
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.mask import add_optional_chunk_mask
+
+class KVCache(torch.nn.Module):
+    def __init__(self, max_batch_size, n_heads, max_seq_short, max_seq_long, head_dim, dtype=torch.float32):
+        super().__init__()
+        cache_shape_short = (max_batch_size, n_heads, max_seq_short, head_dim)
+        self.register_buffer('k_cache_short', torch.zeros(cache_shape_short, dtype=dtype, device='cuda'))
+        self.register_buffer('v_cache_short', torch.zeros(cache_shape_short, dtype=dtype, device='cuda'))
+
+        cache_shape_long = (max_batch_size, n_heads, max_seq_long, head_dim)
+        self.register_buffer('k_cache_long', torch.zeros(cache_shape_long, dtype=dtype, device='cuda'))
+        self.register_buffer('v_cache_long', torch.zeros(cache_shape_long, dtype=dtype, device='cuda'))
+
+        self.max_seq_short = max_seq_short
+        self.max_seq_long = max_seq_long
+    
+    def update(self, input_pos, k_val, v_val, is_infer_short):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k_val.shape[2]
+        if is_infer_short:
+            k_out = self.k_cache_short
+            v_out = self.v_cache_short
+        else:
+            k_out = self.k_cache_long
+            v_out = self.v_cache_long
+
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+        return k_out, v_out
 
 
 class BaseEncoder(torch.nn.Module):
@@ -54,6 +84,8 @@ class BaseEncoder(torch.nn.Module):
         global_cmvn: torch.nn.Module = None,
         use_dynamic_left_chunk: bool = False,
         gradient_checkpointing: bool = False,
+        max_seq_short: int = 256,
+        max_seq_long: int = 2048,
     ):
         """
         Args:
@@ -104,7 +136,18 @@ class BaseEncoder(torch.nn.Module):
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
         self.gradient_checkpointing = gradient_checkpointing
-
+        self.attention_heads = attention_heads
+        self.head_dim = output_size // attention_heads
+        self.compiled_infer_short = None
+        self.compiled_infer_long = None
+        self.max_seq_short = max_seq_short
+        self.max_seq_long = max_seq_long
+        
+    def setup_caches(self, max_seq_short, max_seq_long, dtype=torch.float32):
+        assert max_seq_short == self.max_seq_short and max_seq_long == self.max_seq_long
+        for it in self.encoders:
+            it.self_attn.kv_cache = KVCache(1, self.attention_heads, self.max_seq_short, self.max_seq_long, self.head_dim, dtype)
+               
     def output_size(self) -> int:
         return self._output_size
 
@@ -169,7 +212,7 @@ class BaseEncoder(torch.nn.Module):
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
         return xs
 
-    @torch.jit.unused
+    @torch.jit.ignore(drop=True)
     def forward_layers_checkpointed(self, xs: torch.Tensor,
                                     chunk_masks: torch.Tensor,
                                     pos_emb: torch.Tensor,
@@ -180,7 +223,6 @@ class BaseEncoder(torch.nn.Module):
                                                     mask_pad)
         return xs
 
-    @torch.jit.export
     def forward_chunk(
         self,
         xs: torch.Tensor,
@@ -271,7 +313,161 @@ class BaseEncoder(torch.nn.Module):
 
         return (xs, r_att_cache, r_cnn_cache)
 
-    @torch.jit.unused
+    def inference_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
+                       pos_emb: torch.Tensor,
+                       mask_pad: torch.Tensor) -> torch.Tensor:
+        for layer in self.encoders:
+            xs, chunk_masks, _ = layer.inference(xs, chunk_masks, pos_emb, mask_pad)
+        return xs
+
+    @torch.jit.ignore(drop=True)
+    def inference_layers_checkpointed(self, xs: torch.Tensor,
+                                    chunk_masks: torch.Tensor,
+                                    pos_emb: torch.Tensor,
+                                    mask_pad: torch.Tensor) -> torch.Tensor:
+        for layer in self.encoders:
+            xs, chunk_masks, _ = ckpt.checkpoint(layer.inference, xs,
+                                                    chunk_masks, pos_emb,
+                                                    mask_pad)
+        return xs
+
+    def inference_prefill(
+        self,
+        xs: torch.Tensor,
+        offset: int,
+        cache_offset: int,
+        att_mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        fix_shape=False,
+        is_infer_short=False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert xs.size(0) == 1
+        # tmp_masks is just for interface compatibility
+        tmp_masks = torch.ones(1,
+                               xs.size(1),
+                               device=xs.device,
+                               dtype=torch.bool)
+        tmp_masks = tmp_masks.unsqueeze(1)
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        # NOTE(xcsong): Before embed, shape(xs) is (b=1, time, mel-dim)
+        xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
+        # NOTE(xcsong): After  embed, shape(xs) is (b=1, chunk_size, hidden-dim)
+        chunk_size = xs.size(1)
+        attention_key_size = cache_offset + chunk_size
+        max_seq = self.max_seq_short if is_infer_short else self.max_seq_long
+        if fix_shape: 
+            pos_emb = self.embed.position_encoding(offset=offset - cache_offset,
+                                                size=attention_key_size)
+            target_seq_len = max_seq * 2 - 1
+            current_seq_len = pos_emb.size(1)
+            padding_size = target_seq_len - current_seq_len
+            pos_emb = F.pad(pos_emb, (0, 0, 0, padding_size))
+        else:
+            pos_emb = self.embed.position_encoding(offset=offset - cache_offset,
+                                                size=attention_key_size)
+        cache_offset = torch.arange(0, xs.shape[1], device=xs.device, dtype=torch.int)
+
+        for i, layer in enumerate(self.encoders):
+            xs, _, _ = layer.inference(
+                xs,
+                att_mask,
+                pos_emb,
+                cache_offset=cache_offset,
+                is_infer_short=is_infer_short,
+            )
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+
+        return xs
+
+    def prepare_for_decode(
+        self,
+        xs: torch.Tensor,
+        offset: int,
+        cache_offset: int,
+        is_infer_short: bool,
+    ):
+        # assert xs.size(0) == 1
+        chunk_size = xs.size(1)
+        tmp_masks = torch.ones(1, chunk_size,
+                            device=xs.device, dtype=torch.bool)
+        tmp_masks = tmp_masks.unsqueeze(1)
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        xs, _, _ = self.embed(xs, tmp_masks, offset)
+        attention_key_size = cache_offset + chunk_size
+        max_seq = self.max_seq_short if is_infer_short else self.max_seq_long
+        pos_emb = self.embed.fix_position_encoding(offset=offset - cache_offset,
+                                               size=attention_key_size, max_len=max_seq)
+        # target_seq_len = self.max_seq * 2 - 1
+        # current_seq_len = 2 * attention_key_size - 1
+        # padding_size = target_seq_len - current_seq_len
+        # pos_emb = F.pad(pos_emb, (0, 0, 0, padding_size))
+        return xs, pos_emb
+
+    def step_infer_short(
+        self,
+        xs: torch.Tensor,
+        pos_emb: torch.Tensor,
+        cache_offset: torch.Tensor,
+        att_mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+    ):
+        for i, layer in enumerate(self.encoders):
+            xs, _, _ = layer.inference(
+                xs,
+                att_mask,
+                pos_emb,
+                cache_offset=cache_offset,
+                is_infer_short = True,
+            )
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+        return xs
+    
+    def step_infer_long(
+        self,
+        xs: torch.Tensor,
+        pos_emb: torch.Tensor,
+        cache_offset: torch.Tensor,
+        att_mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+    ):
+        for i, layer in enumerate(self.encoders):
+            xs, _, _ = layer.inference(
+                xs,
+                att_mask,
+                pos_emb,
+                cache_offset=cache_offset,
+                is_infer_short=False,
+            )
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+        return xs
+
+    def inference_decode_step(
+        self,
+        xs: torch.Tensor,
+        offset: int,
+        cache_offset: int,
+        att_mask,
+        is_infer_short,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        xs, pos_emb = self.prepare_for_decode(xs, offset, cache_offset, is_infer_short)
+        cache_offset = torch.tensor([cache_offset], device=xs.device, dtype=torch.int32)
+
+        # print("xs, att_mask: ", xs.shape, att_mask.shape)
+
+        if is_infer_short:
+            if self.compiled_infer_short == None:
+                self.compiled_infer_short = torch.compile(self.step_infer_short, mode="reduce-overhead", fullgraph=True)
+            ret = self.compiled_infer_short(xs, pos_emb, cache_offset, att_mask)
+        elif not is_infer_short:
+            if self.compiled_infer_long == None:
+                self.compiled_infer_long = torch.compile(self.step_infer_long, mode="reduce-overhead", fullgraph=True)
+            ret = self.compiled_infer_long(xs, pos_emb, cache_offset, att_mask)
+
+        return ret.clone()
+
     def forward_chunk_by_chunk(
         self,
         xs: torch.Tensor,
@@ -299,7 +495,7 @@ class BaseEncoder(torch.nn.Module):
                rate.
             3. Currently, nn.Sequential is used to stack all the convolution
                layers in subsampling, we need to rewrite it to make it work
-               with cache, which is not preferred.
+               with cache, which is not prefered.
         Args:
             xs (torch.Tensor): (1, max_len, dim)
             chunk_size (int): decoding chunk size
@@ -359,6 +555,8 @@ class TransformerEncoder(BaseEncoder):
         selfattention_layer_type: str = "selfattn",
         activation_type: str = "relu",
         gradient_checkpointing: bool = False,
+        max_seq_short: int = 256,
+        max_seq_long: int = 2048,
     ):
         """ Construct TransformerEncoder
 
@@ -369,7 +567,7 @@ class TransformerEncoder(BaseEncoder):
                          positional_dropout_rate, attention_dropout_rate,
                          input_layer, pos_enc_layer_type, normalize_before,
                          static_chunk_size, use_dynamic_chunk, global_cmvn,
-                         use_dynamic_left_chunk, gradient_checkpointing)
+                         use_dynamic_left_chunk, gradient_checkpointing, max_seq_short, max_seq_long)
         activation = COSYVOICE_ACTIVATION_CLASSES[activation_type]()
         self.encoders = torch.nn.ModuleList([
             TransformerEncoderLayer(
@@ -414,6 +612,8 @@ class ConformerEncoder(BaseEncoder):
         cnn_module_norm: str = "batch_norm",
         key_bias: bool = True,
         gradient_checkpointing: bool = False,
+        max_seq_short: int = 256,
+        max_seq_long: int = 2048,
     ):
         """Construct ConformerEncoder
 
@@ -437,7 +637,7 @@ class ConformerEncoder(BaseEncoder):
                          positional_dropout_rate, attention_dropout_rate,
                          input_layer, pos_enc_layer_type, normalize_before,
                          static_chunk_size, use_dynamic_chunk, global_cmvn,
-                         use_dynamic_left_chunk, gradient_checkpointing)
+                         use_dynamic_left_chunk, gradient_checkpointing, max_seq_short, max_seq_long)
         activation = COSYVOICE_ACTIVATION_CLASSES[activation_type]()
 
         # self-attention module definition

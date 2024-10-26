@@ -49,6 +49,8 @@ class MultiHeadedAttention(nn.Module):
         self.linear_v = nn.Linear(n_feat, n_feat)
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
+        self.dropout_rate = dropout_rate
+        self.kv_cache = None
 
     def forward_qkv(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
@@ -73,9 +75,6 @@ class MultiHeadedAttention(nn.Module):
         q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
         k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
         v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
-        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
-        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
-        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
 
         return q, k, v
 
@@ -166,6 +165,9 @@ class MultiHeadedAttention(nn.Module):
 
         """
         q, k, v = self.forward_qkv(query, key, value)
+        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
 
         # NOTE(xcsong):
         #   when export onnx model, for 1st chunk, we feed
@@ -196,6 +198,70 @@ class MultiHeadedAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         return self.forward_attention(v, scores, mask), new_cache
 
+    def inference(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        pos_emb: torch.Tensor = torch.empty(0),
+        cache_offset: torch.Tensor = None,
+        is_infer_short: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute scaled dot product attention.
+
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
+                (#batch, time1, time2).
+                1.When applying cross attention between decoder and encoder,
+                the batch padding mask for input is in (#batch, 1, T) shape.
+                2.When applying self attention of encoder,
+                the mask is in (#batch, T, T)  shape.
+                3.When applying self attention of decoder,
+                the mask is in (#batch, L, L)  shape.
+                4.If the different position in decoder see different block
+                of the encoder, such as Mocha, the passed in mask could be
+                in (#batch, L, T) shape. But there is no such case in current
+                CosyVoice.
+            cache (torch.Tensor): Cache tensor (1, head, cache_t, d_k * 2),
+                where `cache_t == chunk_size * num_decoding_left_chunks`
+                and `head * d_k == size`
+
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time1, d_model).
+            torch.Tensor: Cache tensor (1, head, cache_t + time1, d_k * 2)
+                where `cache_t == chunk_size * num_decoding_left_chunks`
+                and `head * d_k == size`
+
+        """
+        q, k, v = self.forward_qkv(query, key, value)
+        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
+
+        if self.kv_cache is not None:
+            k, v = self.kv_cache.update(cache_offset, k, v, is_infer_short)
+
+        assert mask.dtype == torch.bool
+        mask = mask.unsqueeze(1).eq(False) * torch.finfo(q.dtype).min
+
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=self.dropout_rate,
+            scale=1 / math.sqrt(self.d_k),
+        )
+        output = (output.transpose(1, 2).contiguous().view(
+            query.size(0), -1,
+            self.h * self.d_k))  # (batch, time1, d_model)
+        return self.linear_out(output)
+
 
 class RelPositionMultiHeadedAttention(MultiHeadedAttention):
     """Multi-Head Attention layer with relative position encoding.
@@ -222,7 +288,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         torch.nn.init.xavier_uniform_(self.pos_bias_u)
         torch.nn.init.xavier_uniform_(self.pos_bias_v)
 
-    def rel_shift(self, x: torch.Tensor) -> torch.Tensor:
+    def rel_shift(self, x):
         """Compute relative positional encoding.
 
         Args:
@@ -233,14 +299,10 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
             torch.Tensor: Output tensor.
 
         """
-        zero_pad = torch.zeros((x.size()[0], x.size()[1], x.size()[2], 1),
-                               device=x.device,
-                               dtype=x.dtype)
+        zero_pad = torch.zeros((*x.size()[:3], 1), device=x.device, dtype=x.dtype)
         x_padded = torch.cat([zero_pad, x], dim=-1)
 
-        x_padded = x_padded.view(x.size()[0],
-                                 x.size()[1],
-                                 x.size(3) + 1, x.size(2))
+        x_padded = x_padded.view(*x.size()[:2], x.size(3) + 1, x.size(2))
         x = x_padded[:, :, 1:].view_as(x)[
             :, :, :, : x.size(-1) // 2 + 1
         ]  # only keep the positions from 0 to time2
@@ -274,7 +336,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
                 and `head * d_k == size`
         """
         q, k, v = self.forward_qkv(query, key, value)
-        q = q.transpose(1, 2)  # (batch, time1, head, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
 
         # NOTE(xcsong):
         #   when export onnx model, for 1st chunk, we feed
@@ -328,3 +391,70 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
             self.d_k)  # (batch, head, time1, time2)
 
         return self.forward_attention(v, scores, mask), new_cache
+
+    def inference(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        pos_emb: torch.Tensor = torch.empty(0),
+        cache_offset: torch.Tensor = None,
+        is_infer_short: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
+                (#batch, time1, time2), (0, 0, 0) means fake mask.
+            pos_emb (torch.Tensor): Positional embedding tensor
+                (#batch, time2, size).
+            cache (torch.Tensor): Cache tensor (1, head, cache_t, d_k * 2),
+                where `cache_t == chunk_size * num_decoding_left_chunks`
+                and `head * d_k == size`
+        Returns:
+            torch.Tensor: Output tensor (#batch, time1, d_model).
+            torch.Tensor: Cache tensor (1, head, cache_t + time1, d_k * 2)
+                where `cache_t == chunk_size * num_decoding_left_chunks`
+                and `head * d_k == size`
+        """
+        q, k, v = self.forward_qkv(query, key, value)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
+    
+        if self.kv_cache is not None:
+            k, v = self.kv_cache.update(cache_offset, k, v, is_infer_short)
+
+        n_batch_pos = pos_emb.size(0)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        p = p.transpose(1, 2)  # (batch, head, time1, d_k)
+
+        # (batch, head, time1, d_k)
+        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
+        # (batch, head, time1, d_k)
+        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
+
+        # compute matrix b and matrix d
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1)) 
+        # NOTE(Xiang Lyu): Keep rel_shift since espnet rel_pos_emb is used
+        matrix_bd = self.rel_shift(matrix_bd) 
+
+        assert mask.dtype == torch.bool
+        
+        mask = mask.unsqueeze(1).eq(False)
+        mask = (matrix_bd / math.sqrt(self.d_k)).masked_fill(mask, torch.tensor(-float('inf'), dtype=matrix_bd.dtype))
+
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q_with_bias_u,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=self.dropout_rate,
+            scale=1 / math.sqrt(self.d_k),
+        )
+
+        output = (output.transpose(1, 2).contiguous().view(
+            query.size(0), -1, self.h * self.d_k))  # (batch, time1, d_model)
+        return self.linear_out(output)
